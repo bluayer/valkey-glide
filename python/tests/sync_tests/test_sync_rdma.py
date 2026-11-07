@@ -91,6 +91,9 @@ class _FakeFfi:
     def from_buffer(self, memory):
         return memory
 
+    def cast(self, kind, value):
+        return value
+
     def release(self, view):
         pass
 
@@ -116,6 +119,8 @@ class _FakeLib:
         self.freed_holds = []
         # The size of every buffer `register_rdma_region` was asked to register.
         self.registrations = []
+        # (address, length) of every `register_rdma_device_region`.
+        self.device_registrations = []
         # What `rdma_set` reports, if not a success.
         self.set_result = None
         # When set, `rdma_set` sets `set_started` and then waits for this, so a
@@ -152,6 +157,10 @@ class _FakeLib:
 
     def register_rdma_region(self, client, buffer, length):
         self.registrations.append(length)
+        return _FakeRegistration(_FakeRegion())
+
+    def register_rdma_device_region(self, client, address, length):
+        self.device_registrations.append((address, length))
         return _FakeRegistration(_FakeRegion())
 
     def free_rdma_registration(self, registration):
@@ -810,6 +819,233 @@ def test_memory_registers_again_once_the_fabric_lets_go():
     region.close()
 
 
+class _FakeCudaArray:
+    """GPU memory as PyTorch and CuPy describe it, never dereferenced."""
+
+    def __init__(
+        self,
+        address: int = 0x7F00_0000_0000,
+        shape: tuple = (4, 256),
+        typestr: str = "<f4",
+        strides=None,
+        readonly: bool = False,
+        device: tuple = (2, 0),
+        mask=None,
+    ):
+        self.address = address
+        self.shape = shape
+        self.typestr = typestr
+        self.strides = strides
+        self.readonly = readonly
+        self.device = device
+        self.mask = mask
+
+    def __dlpack_device__(self):
+        return self.device
+
+    @property
+    def __cuda_array_interface__(self):
+        return {
+            "data": (self.address, self.readonly),
+            "shape": self.shape,
+            "typestr": self.typestr,
+            "strides": self.strides,
+            "mask": self.mask,
+            "version": 3,
+        }
+
+
+class _FakeOldTorchBfloat16(_FakeCudaArray):
+    """A bfloat16 CUDA tensor of a PyTorch with no typestr for it."""
+
+    def __init__(self, contiguous: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        self.contiguous = contiguous
+
+    @property
+    def __cuda_array_interface__(self):
+        raise KeyError("torch.bfloat16")
+
+    def data_ptr(self) -> int:
+        return self.address
+
+    def is_contiguous(self) -> bool:
+        return self.contiguous
+
+    def numel(self) -> int:
+        return self.shape[0] * self.shape[1]
+
+    def element_size(self) -> int:
+        return 2
+
+
+def test_cuda_memory_is_registered_by_its_address_and_length():
+    # The pointer and byte count both come from the object, so
+    # `register_rdma_region(tensor)` is the whole call.
+    client = _offline_client()
+    client._core_client = object()
+    memory = _FakeCudaArray(shape=(4, 256), typestr="<f4", device=(2, 1))
+
+    region = client.register_rdma_region(memory)
+
+    assert client._lib.device_registrations == [(memory.address, 4096)]
+    assert client._lib.registrations == [], "not the host path"
+    assert region.capacity == 4096
+    assert repr(region) == "RdmaRegion(4096 bytes of CUDA memory)"
+    region.close()
+
+
+def test_a_tensor_without_a_cuda_array_interface_is_registered_by_data_ptr():
+    # PyTorch before bfloat16 had a typestr raised for it, and bfloat16 is what
+    # model caches are usually made of.
+    client = _offline_client()
+    client._core_client = object()
+    memory = _FakeOldTorchBfloat16(shape=(8, 64))
+
+    client.register_rdma_region(memory).close()
+
+    assert client._lib.device_registrations == [(memory.address, 1024)]
+
+
+def test_size_one_dimensions_may_carry_any_stride():
+    # NumPy and PyTorch report arbitrary strides for dimensions of extent 1,
+    # which do not make the memory any less contiguous.
+    client = _offline_client()
+    client._core_client = object()
+    memory = _FakeCudaArray(shape=(1, 4, 8), typestr="|u1", strides=(999, 8, 1))
+
+    client.register_rdma_region(memory).close()
+
+    assert client._lib.device_registrations == [(memory.address, 32)]
+
+
+@pytest.mark.parametrize(
+    ("memory", "message"),
+    [
+        pytest.param(_FakeCudaArray(readonly=True), "must be writable", id="read-only"),
+        pytest.param(
+            _FakeCudaArray(shape=(4, 4), typestr="<f4", strides=(32, 4)),
+            "C-contiguous",
+            id="strided",
+        ),
+        pytest.param(
+            _FakeOldTorchBfloat16(contiguous=False), "C-contiguous", id="torch-strided"
+        ),
+        pytest.param(_FakeCudaArray(mask=object()), "mask", id="masked"),
+        pytest.param(_FakeCudaArray(device=(13, 0)), "managed memory", id="managed"),
+        pytest.param(_FakeCudaArray(device=(10, 0)), "device type 10", id="rocm"),
+    ],
+)
+def test_unusable_gpu_memory_is_refused_before_registration(memory, message):
+    client = _offline_client()
+    client._core_client = object()
+
+    with pytest.raises(TypeError, match=message):
+        client.register_rdma_region(memory)
+
+    assert client._lib.device_registrations == []
+
+
+def test_cuda_memory_without_an_address_is_refused():
+    class _NoAddress:
+        def __dlpack_device__(self):
+            return (2, 0)
+
+    client = _offline_client()
+    client._core_client = object()
+
+    with pytest.raises(TypeError, match="__cuda_array_interface__"):
+        client.register_rdma_region(_NoAddress())
+
+
+def test_host_memory_takes_the_host_path_without_being_asked_about_a_gpu():
+    # A NumPy array has `__dlpack_device__` too. Memory with the buffer protocol
+    # registers as it always did, without that being called.
+    class _HostArray(bytearray):
+        def __dlpack_device__(self):
+            raise AssertionError("a buffer is not asked about a GPU")
+
+    client = _offline_client()
+    client._core_client = object()
+
+    client.register_rdma_region(_HostArray(REGION_BYTES)).close()
+
+    assert client._lib.registrations == [REGION_BYTES]
+    assert client._lib.device_registrations == []
+
+
+@pytest.mark.parametrize(
+    "memory",
+    [
+        pytest.param(object(), id="no-dlpack"),
+        pytest.param(
+            type("_CpuTensor", (), {"__dlpack_device__": lambda self: (1, 0)})(),
+            id="host-dlpack",
+        ),
+    ],
+)
+def test_memory_that_is_neither_a_buffer_nor_on_a_gpu_keeps_its_error(memory):
+    # Such as a CPU torch.Tensor: refused with the buffer protocol's own error,
+    # as before GPU memory was accepted.
+    client = _offline_client()
+    client._core_client = object()
+
+    with pytest.raises(TypeError, match="bytes-like object is required"):
+        client.register_rdma_region(memory)
+
+
+def test_a_gpu_region_has_no_host_view():
+    # The CPU cannot address GPU memory, so a view of it would read garbage
+    # or fault.
+    client = _offline_client()
+    client._core_client = object()
+    region = client.register_rdma_region(_FakeCudaArray())
+
+    with pytest.raises(RdmaError, match="GPU memory"):
+        region.memoryview()
+    with pytest.raises(RdmaError, match="GPU memory"):
+        region.window(0, 8).memoryview()
+    region.close()
+
+
+def test_gpu_memory_that_moved_is_refused_before_the_ffi():
+    # A tensor can move to new storage after registration, which the fabric
+    # cannot see: it would keep transferring the old storage.
+    client = _offline_client()
+    client._core_client = object()
+    memory = _FakeCudaArray()
+    region = client.register_rdma_region(memory)
+    registered_at = memory.address
+
+    memory.address += 4096
+    with pytest.raises(RdmaError, match="has moved"):
+        client.rdma_get(b"key", region.window(0, 8))
+    assert client._lib.sets == [], "refused before the FFI"
+    assert region.closed is False
+
+    memory.address = registered_at
+    client.rdma_get(b"key", region.window(0, 8))
+    assert len(client._lib.sets) == 1, "the region was left usable"
+    region.close()
+
+
+def test_gpu_memory_still_held_is_refused_for_a_new_region():
+    client = _offline_client()
+    client._core_client = object()
+    memory = _FakeCudaArray()
+    raw = _FakeRegion()
+    hold = {"released": False}
+    client._lib.holds[id(raw)] = hold
+    RdmaRegion(client, memory, raw, (memory.address, memory.address + 4096)).close()
+    try:
+        with pytest.raises(RdmaError, match="could still write into it"):
+            client.register_rdma_region(_FakeCudaArray(address=memory.address + 8))
+        assert client._lib.device_registrations == []
+    finally:
+        hold["released"] = True
+        _RETAINED_RDMA_MEMORY.release_what_is_free()
+
+
 def test_a_second_transfer_on_a_region_in_use_is_refused():
     # Both FFI calls would take the region exclusively at once, so the second
     # is refused in Python before it reaches the FFI.
@@ -1418,6 +1654,36 @@ def test_an_rdma_client_against_a_plain_server_still_works(
             region.close()
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("cluster_mode", [False])
+@pytest.mark.parametrize("protocol", [ProtocolVersion.RESP3])
+def test_gpu_memory_needs_a_client_with_device_memory(glide_sync_client: GlideClient):
+    # Through the real FFI: a client opened for host memory refuses GPU memory
+    # by naming the setting, before the fabric would touch the address, and a
+    # client asking for device memory on a provider without FI_HMEM is not
+    # created at all.
+    if not GlideClient.rdma_usable():
+        pytest.skip("needs libfabric to open a tcp fabric")
+    addresses = glide_sync_client._config.addresses
+    client = GlideClient.create(
+        GlideClientConfiguration(
+            addresses=addresses, rdma=RdmaConfiguration(provider=RdmaProvider.Tcp())
+        )
+    )
+    try:
+        with pytest.raises(RdmaError, match="device memory"):
+            client.register_rdma_region(_FakeCudaArray())
+    finally:
+        client.close()
+
+    with pytest.raises(ClosingError, match="FI_HMEM"):
+        GlideClient.create(
+            GlideClientConfiguration(
+                addresses=addresses,
+                rdma=RdmaConfiguration(provider=RdmaProvider.Tcp(), device_memory=True),
+            )
+        )
 
 
 class _DroppingProxy:

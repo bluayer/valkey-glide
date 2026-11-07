@@ -93,6 +93,31 @@ def test_interface_is_optional():
     assert request.rdma_config.HasField("interface") is False
 
 
+def test_device_memory_is_off_unless_asked_for():
+    # Left unset, the core opens the fabric for host memory only, so a host
+    # without FI_HMEM keeps working.
+    request = _request(RdmaConfiguration(provider=RdmaProvider.EfaDirect()))
+
+    assert request.rdma_config.HasField("device_memory") is False
+
+
+def test_device_memory_reaches_the_request():
+    request = _request(
+        RdmaConfiguration(provider=RdmaProvider.EfaDirect(), device_memory=True)
+    )
+
+    assert request.rdma_config.device_memory is True
+
+
+def test_device_memory_must_be_a_bool():
+    # A truthy string would otherwise switch it on silently.
+    with pytest.raises(ConfigurationError, match="device_memory must be a bool"):
+        RdmaConfiguration(
+            provider=RdmaProvider.EfaDirect(),
+            device_memory="yes",  # type: ignore[arg-type]
+        )
+
+
 def test_efa_direct_has_no_bind_to_set():
     # efa-direct has no IP to bind. Carrying `bind` on Tcp rather than on the
     # configuration makes that a type error instead of a runtime check.
